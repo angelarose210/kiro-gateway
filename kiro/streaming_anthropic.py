@@ -661,7 +661,16 @@ async def stream_kiro_to_anthropic(
         yield format_sse_event("message_stop", {
             "type": "message_stop"
         })
-        
+
+        # Persist usage to JSONL for the dashboard
+        from kiro.usage_logger import log_usage
+        log_usage(
+            model=model,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        )
+
         # Save truncation info for recovery (tracked by stable identifiers)
         from kiro.truncation_recovery import should_inject_recovery
         from kiro.truncation_state import save_tool_truncation, save_content_truncation
@@ -844,7 +853,16 @@ async def collect_anthropic_response(
         f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
         f"tool_calls={len(result.tool_calls)}, stop_reason={stop_reason}"
     )
-    
+
+    # Persist usage to JSONL for the dashboard
+    from kiro.usage_logger import log_usage
+    log_usage(
+        model=model,
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+    )
+
     usage_payload: Dict[str, Any] = {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens

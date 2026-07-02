@@ -38,7 +38,7 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, FIRST_TOKEN_TIMEOUT, STREAMING_READ_TIMEOUT
 from kiro.auth import KiroAuthManager
 from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
@@ -229,7 +229,18 @@ class KiroHttpClient:
                     headers["Connection"] = "close"
                     req = client.build_request(method, url, **request_kwargs)
                     logger.debug("Sending request to Kiro API...")
-                    response = await client.send(req, stream=True)
+                    # Bound the time-to-response-headers with FIRST_TOKEN_TIMEOUT.
+                    # Without this, a stalled upstream (Amazon risk-control on bursty
+                    # agentic/subagent traffic) leaves us blocked in client.send() until
+                    # the 300s STREAMING_READ_TIMEOUT, with no retry — the request hangs
+                    # indefinitely from the client's perspective. The per-chunk first-token
+                    # timeout in parse_kiro_stream only guards AFTER headers arrive, so the
+                    # header-wait phase needs its own bound. On timeout we fall through to
+                    # the same retryable path as other timeouts below.
+                    response = await asyncio.wait_for(
+                        client.send(req, stream=True),
+                        timeout=FIRST_TOKEN_TIMEOUT
+                    )
                 else:
                     logger.debug("Sending request to Kiro API...")
                     response = await client.request(method, url, **request_kwargs)
@@ -262,6 +273,23 @@ class KiroHttpClient:
                 
                 # Other errors - return as is
                 return response
+                
+            except asyncio.TimeoutError as e:
+                # Streaming header-wait exceeded FIRST_TOKEN_TIMEOUT (see client.send above).
+                # Treat exactly like a retryable network timeout: back off and retry, so a
+                # stalled upstream fails fast instead of hanging until STREAMING_READ_TIMEOUT.
+                last_error = e
+                error_info = classify_network_error(
+                    httpx.ReadTimeout(f"No response headers within {FIRST_TOKEN_TIMEOUT}s")
+                )
+                last_error_info = error_info
+                short_msg = f"Slow upstream: no response headers within {FIRST_TOKEN_TIMEOUT}s"
+                if attempt < max_retries - 1:
+                    delay = BASE_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(f"{short_msg} - waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"{short_msg} - no more retries (attempt {attempt + 1}/{max_retries})")
                 
             except httpx.TimeoutException as e:
                 last_error = e

@@ -69,16 +69,72 @@ def generate_truncation_tool_result(
         >>> generate_truncation_tool_result("Write", "call_123", {"size_bytes": 5000, "reason": "missing 2 closing braces"})
         {'type': 'tool_result', 'tool_use_id': 'call_123', 'content': '[API Limitation] ...', 'is_error': True}
     """
-    content = (
-        "[API Limitation] Your tool call was truncated by the upstream API due to output size limits.\n\n"
-        "If the tool result below shows an error or unexpected behavior, this is likely a CONSEQUENCE of the truncation, "
-        "not the root cause. The tool call itself was cut off before it could be fully transmitted.\n\n"
-        "Repeating the exact same operation will be truncated again. Consider adapting your approach."
-    )
-    
+    size_bytes = truncation_info.get("size_bytes", 0)
+    reason = truncation_info.get("reason", "incomplete tool call")
+    tool_lower = (tool_name or "").lower()
+
+    # Distinguish two very different failure modes that the old one-size message
+    # conflated:
+    #
+    #  - SMALL truncations (the common case for subagents — tens to a few hundred
+    #    bytes) are a TRANSIENT upstream stream cutoff, NOT an output-size limit.
+    #    The old message told the model "output too large", which is misleading and
+    #    makes it needlessly shrink or abandon a tiny, correct call. For these, a
+    #    straight retry usually succeeds.
+    #  - LARGE truncations are genuine size pressure, where repeating the same call
+    #    will truncate again and the work must be split into smaller pieces.
+    SMALL_TRUNCATION_BYTES = 1024
+
+    is_write_like = any(k in tool_lower for k in ("write", "edit", "replace", "create", "notebook", "multiedit"))
+    is_agent_like = any(k in tool_lower for k in ("agent", "task"))
+
+    if size_bytes <= SMALL_TRUNCATION_BYTES:
+        lead = (
+            "[Upstream Glitch] Your tool call was cut off mid-transmission by the upstream API "
+            f"before it finished (only {size_bytes} bytes arrived; {reason}). This is a known, "
+            "intermittent upstream issue \u2014 NOT a problem with your input and NOT an output-size "
+            "limit. The error in the tool result below is a CONSEQUENCE of that cutoff.\n\n"
+        )
+        if is_agent_like:
+            action = (
+                "Recommended: just retry launching the same subagent again. These cutoffs are "
+                "transient and the retry typically succeeds \u2014 do not abandon or redesign the task."
+            )
+        elif is_write_like:
+            action = (
+                "Recommended: retry the same edit once. If it is cut off again, write the file in "
+                "smaller pieces (create it with the first portion, then append the rest) so each "
+                "individual call is smaller."
+            )
+        else:
+            action = (
+                "Recommended: retry the same tool call \u2014 these transient cutoffs usually "
+                "succeed on the next attempt."
+            )
+    else:
+        lead = (
+            "[API Limitation] Your tool call was truncated by the upstream API due to its size "
+            f"({size_bytes} bytes; {reason}). It was cut off before it could be fully transmitted, "
+            "so the tool result below reflects that incomplete call, not a problem with your logic.\n\n"
+        )
+        if is_write_like:
+            action = (
+                "Repeating the same large operation will be truncated again. Split it: write an "
+                "initial smaller version of the file, then append/extend it in follow-up calls so "
+                "no single call is too big."
+            )
+        else:
+            action = (
+                "Repeating the exact same operation will be truncated again. Reduce the size of this "
+                "call's input, or break the work into smaller steps."
+            )
+
+    content = lead + action
+
     logger.debug(
         f"Generated synthetic tool_result for truncated tool '{tool_name}' "
-        f"(id={tool_use_id}, {truncation_info['size_bytes']} bytes, {truncation_info['reason']})"
+        f"(id={tool_use_id}, {size_bytes} bytes, {reason}, "
+        f"mode={'small/transient' if size_bytes <= SMALL_TRUNCATION_BYTES else 'large/size'})"
     )
     
     return {

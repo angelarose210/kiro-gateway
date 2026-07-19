@@ -221,7 +221,42 @@ class TestStreamKiroToOpenai:
         assert len(tool_chunks) >= 1
         assert "get_weather" in tool_chunks[0]
         print("✓ Tool calls chunk yielded")
-    
+
+    @pytest.mark.asyncio
+    async def test_malformed_tool_is_corrective_text_not_tool_call(
+        self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        raw_arguments = '{"path": nope}'
+        malformed_tool = {
+            "id": "call_bad",
+            "function": {"name": "Write", "arguments": raw_arguments},
+            "_protocol_failure": {
+                "classification": "malformed",
+                "reason": "malformed JSON",
+                "size_bytes": len(raw_arguments),
+            },
+            "_executable": False,
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=malformed_tool)
+
+        chunks = []
+        with patch('kiro.streaming_openai.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_openai.parse_bracket_tool_calls', return_value=[]):
+                async for chunk in stream_kiro_to_openai(
+                    mock_http_client, mock_response, "claude-sonnet-4",
+                    mock_model_cache, mock_auth_manager
+                ):
+                    chunks.append(chunk)
+
+        output = "".join(chunks)
+        assert "Tool Protocol Error" in output
+        assert "No tool was executed" in output
+        assert '"tool_calls"' not in output
+        assert '"finish_reason": "stop"' in output
+        assert raw_arguments not in output
+
     @pytest.mark.asyncio
     async def test_tool_calls_have_index(self, mock_http_client, mock_response, mock_model_cache, mock_auth_manager):
         """

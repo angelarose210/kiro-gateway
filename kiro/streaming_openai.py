@@ -125,6 +125,7 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    protocol_failures = []
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -186,7 +187,11 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "tool_use" and event.tool_use:
                 tool = event.tool_use
-                
+
+                if tool.get("_protocol_failure"):
+                    protocol_failures.append(tool)
+                    continue
+
                 # Extract tool name safely (handle None/missing fields)
                 tool_name = ""
                 if tool:
@@ -277,12 +282,35 @@ async def stream_kiro_to_openai_internal(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
+
+        if protocol_failures:
+            from kiro.truncation_recovery import generate_tool_protocol_failure_message
+
+            correction = "\n\n".join(
+                generate_tool_protocol_failure_message(tool)
+                for tool in protocol_failures
+            )
+            full_content += correction
+            delta = {"content": correction}
+            if first_chunk:
+                delta["role"] = "assistant"
+                first_chunk = False
+
+            correction_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            }
+            yield f"data: {json.dumps(correction_chunk, ensure_ascii=False)}\n\n"
         
         # Detect content truncation (missing completion signals)
         content_was_truncated = (
             not stream_completed_normally and
             len(full_content) > 0 and
-            not all_tool_calls  # Don't confuse with tool call truncation
+            not all_tool_calls and
+            not protocol_failures
         )
         
         if content_was_truncated:

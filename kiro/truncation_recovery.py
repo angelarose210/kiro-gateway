@@ -145,6 +145,30 @@ def generate_truncation_tool_result(
     }
 
 
+def generate_tool_protocol_failure_message(tool_call: Dict[str, Any]) -> str:
+    """Generate redacted corrective context for a non-executable tool call."""
+    failure = tool_call.get("_protocol_failure") or {}
+    classification = failure.get("classification", "malformed")
+    reason = failure.get("reason", "invalid JSON arguments")
+    size_bytes = failure.get("size_bytes", 0)
+    function = tool_call.get("function") or {}
+    tool_name = function.get("name") or tool_call.get("name") or "unknown"
+    tool_use_id = tool_call.get("id") or "unknown"
+
+    if classification == "truncated":
+        return generate_truncation_tool_result(
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            truncation_info={"size_bytes": size_bytes, "reason": reason},
+        )["content"] + "\n\nNo tool was executed."
+
+    return (
+        f"[Tool Protocol Error] The upstream model produced malformed JSON arguments "
+        f"for tool '{tool_name}' ({reason}). No tool was executed. Retry the intended "
+        "action using one native structured tool call with valid JSON arguments."
+    )
+
+
 def generate_truncation_user_message() -> str:
     """
     Generate synthetic user message for content truncation.
